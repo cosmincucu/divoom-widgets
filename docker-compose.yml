@@ -1,0 +1,14 @@
+services:
+  divoom-usage-widget:
+    build: .
+    image: divoom-usage-widget
+    container_name: divoom-usage-widget
+    restart: unless-stopped
+    environment:
+      # Long-lived token from `claude setup-token` (sk-ant-oat01-...).
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:?set CLAUDE_CODE_OAUTH_TOKEN}
+      DIVOOM_HOST: ${DIVOOM_HOST:?set DIVOOM_HOST}
+      WIDGET_PANEL: ${WIDGET_PANEL:-1}
+      UPDATE_INTERVAL_SECONDS: ${UPDATE_INTERVAL_SECONDS:-300}
+    # The device is reached by LAN IP, so default bridge networking is fine as
+    # long as the Docker host can route to it.

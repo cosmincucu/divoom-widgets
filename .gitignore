@@ -1,0 +1,21 @@
+# Secrets / local config
+.env
+*.local
+
+# Node
+node_modules/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Logs / scratch
+*.log
+ddg.html
+/preview*.png
+
+# OS
+Thumbs.db
+.DS_Store

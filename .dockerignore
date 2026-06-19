@@ -1,0 +1,13 @@
+.git
+.gitignore
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+tests/
+docs/
+divoom_keeper/
+scripts/
+preview*.png
+*.log

@@ -1,0 +1,7 @@
+# Core usage widget
+Pillow>=10.0
+requests>=2.31
+python-dotenv>=1.0
+
+# Divoom Keeper tray app only (python -m divoom_keeper)
+pystray>=0.19
