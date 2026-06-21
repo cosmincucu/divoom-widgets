@@ -112,6 +112,11 @@ It reads/refreshes the token from `~/.claude/.credentials.json` (kept fresh by
 Claude Code), so no token config is needed. Remove with
 `schtasks /delete /tn DivoomUsageWidget /f`.
 
+Loop mode supervises each update as a subprocess with a kill-timeout (so a hung
+network call after a sleep/wake can't freeze it) and appends progress to
+`~/.divoom-usage-widget.log` (override with `DIVOOM_WIDGET_LOG`) — handy when
+running under `pythonw` with no console.
+
 ### Docker — always-on (e.g. homelab)
 
 No Claude Code install needed on the host — pass a long-lived token instead:
