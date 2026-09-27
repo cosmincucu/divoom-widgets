@@ -1,6 +1,7 @@
 # Secrets / local config
 .env
 *.local
+PLAN.local.md
 
 # Node
 node_modules/

@@ -1,6 +1,6 @@
 import datetime as dt
 
-from usage_widget import claude
+from divoom_widgets.widgets import claude_usage as claude
 
 
 class FakeResp:
@@ -43,7 +43,7 @@ def _fake_api_get(path, token):
 
 def test_get_claude_usage_success(monkeypatch):
     claude._plan_cache = None
-    monkeypatch.setattr(claude, "_get_token", lambda: ("tok", {}))
+    monkeypatch.setattr(claude, "_get_token", lambda: ("tok", {}, False))
     monkeypatch.setattr(claude, "_api_get", _fake_api_get)
     out = claude.get_claude_usage()
     assert out["ok"] is True
@@ -54,7 +54,7 @@ def test_get_claude_usage_success(monkeypatch):
 
 
 def test_get_claude_usage_http_error(monkeypatch):
-    monkeypatch.setattr(claude, "_get_token", lambda: ("tok", {}))
+    monkeypatch.setattr(claude, "_get_token", lambda: ("tok", {}, False))
     monkeypatch.setattr(claude, "_api_get", lambda path, token: FakeResp(500, {}))
     out = claude.get_claude_usage()
     assert out["ok"] is False
@@ -62,13 +62,47 @@ def test_get_claude_usage_http_error(monkeypatch):
 
 
 def test_get_claude_usage_no_token(monkeypatch):
-    monkeypatch.setattr(claude, "_get_token", lambda: (None, {}))
+    monkeypatch.setattr(claude, "_get_token", lambda: (None, {}, False))
     out = claude.get_claude_usage()
     assert out["ok"] is False
 
 
 def test_get_token_prefers_env(monkeypatch):
     monkeypatch.setattr(claude.config, "CLAUDE_OAUTH_TOKEN", "sk-ant-oat01-env")
-    token, creds = claude._get_token()
+    token, creds, dead = claude._get_token()
     assert token == "sk-ant-oat01-env"
     assert creds == {}
+    assert dead is False
+
+
+def test_expired_token_that_cannot_refresh_is_reported_not_retried(monkeypatch):
+    """A copied credentials file shares one refresh token with its origin; once
+    that rotates, this copy is dead. Calling the API anyway earned a 429."""
+    expired = (dt.datetime.now(dt.timezone.utc).timestamp() - 3600) * 1000
+    monkeypatch.setattr(claude.config, "CLAUDE_OAUTH_TOKEN", "")
+    monkeypatch.setattr(claude, "_read_creds", lambda: {
+        "claudeAiOauth": {"accessToken": "stale", "refreshToken": "rotated-away",
+                          "expiresAt": expired}})
+    monkeypatch.setattr(claude, "_refresh_token", lambda creds: None)
+
+    token, _creds, dead = claude._get_token()
+    assert dead is True
+
+    called = []
+    monkeypatch.setattr(claude, "_api_get",
+                        lambda path, tok: called.append(path) or FakeResp(429, {}))
+    out = claude.get_claude_usage()
+    assert out["ok"] is False
+    assert "auth expired" in out["error"]
+    assert called == [], "must not call the API with a token known to be dead"
+
+
+def test_403_is_reported_as_a_scope_problem(monkeypatch):
+    """`claude setup-token` tokens are inference-scoped; the usage endpoint
+    needs user:profile and answers 403. Name it, the body is never shown."""
+    monkeypatch.setattr(claude, "_get_token", lambda: ("tok", {}, False))
+    monkeypatch.setattr(claude, "_api_get", lambda path, token: FakeResp(403, {}))
+    out = claude.get_claude_usage()
+    assert out["ok"] is False
+    assert out["error"] == "token scope"
+    assert "user:profile" in claude.summary(out)
