@@ -1,14 +1,52 @@
 services:
-  divoom-usage-widget:
+  divoom-widgets:
     build: .
-    image: divoom-usage-widget
-    container_name: divoom-usage-widget
+    image: divoom-widgets
+    container_name: divoom-widgets
     restart: unless-stopped
+    # tini as PID 1 so SIGTERM from `docker stop` actually terminates python.
+    init: true
     environment:
-      # Long-lived token from `claude setup-token` (sk-ant-oat01-...).
-      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:?set CLAUDE_CODE_OAUTH_TOKEN}
       DIVOOM_HOST: ${DIVOOM_HOST:?set DIVOOM_HOST}
-      WIDGET_PANEL: ${WIDGET_PANEL:-1}
+      # Widget:panel assignments, e.g. "claude_usage:3,energy:2,codex_usage:4".
+      WIDGETS: ${WIDGETS:-claude_usage:1}
       UPDATE_INTERVAL_SECONDS: ${UPDATE_INTERVAL_SECONDS:-300}
+      ENERGY_INTERVAL_SECONDS: ${ENERGY_INTERVAL_SECONDS:-60}
+      CODEX_INTERVAL_SECONDS: ${CODEX_INTERVAL_SECONDS:-${UPDATE_INTERVAL_SECONDS:-300}}
+      # NOTE: a `claude setup-token` token does NOT work for this widget — it is
+      # inference-scoped and the usage endpoint needs user:profile (403).
+      # Use the mounted credentials directory below instead.
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
+      # Codex widget: SigNoz query-service URL + API key (Settings → API Keys);
+      # the Codex transcripts must be shipped into that SigNoz as logs.
+      SIGNOZ_URL: ${SIGNOZ_URL:-}
+      SIGNOZ_API_KEY: ${SIGNOZ_API_KEY:-}
+      CODEX_SERVICE_NAME: ${CODEX_SERVICE_NAME:-codex-transcripts}
+      # Optional: post every widget's numbers as OTLP gauges (empty = off).
+      LO_ENDPOINT: ${LO_ENDPOINT:-}
+      LO_INGEST_TOKEN: ${LO_INGEST_TOKEN:-}
+      # Energy widget: Home Assistant URL + long-lived access token + entity ids.
+      HA_BASE_URL: ${HA_BASE_URL:-}
+      HA_TOKEN: ${HA_TOKEN:-}
+      HA_ENTITY_LOAD: ${HA_ENTITY_LOAD:-}
+      HA_ENTITY_SOLAR: ${HA_ENTITY_SOLAR:-}
+      HA_ENTITY_SOC: ${HA_ENTITY_SOC:-}
+      HEARTBEAT_FILE: /tmp/heartbeat
+    # Claude credentials: mount the DIRECTORY, not the file — refreshing the
+    # token writes a tempfile and os.replace()s it, which fails on a
+    # bind-mounted single file. Populate it from a login that belongs to this
+    # container alone (CLAUDE_CONFIG_DIR=… claude), never a copy of a login you
+    # still use: one refresh token is shared, so the first rotation on either
+    # side permanently breaks the other.
+    # volumes:
+    #   - ./claude:/app/.claude          # containing .credentials.json
+    # and set CLAUDE_CREDENTIALS_PATH: /app/.claude/.credentials.json
+    # Unhealthy when the loop stops completing cycles OR the device itself
+    # stops answering (see divoom_widgets/healthcheck.py).
+    healthcheck:
+      test: ["CMD", "python", "-m", "divoom_widgets.healthcheck"]
+      interval: 60s
+      timeout: 10s
+      start_period: 120s
     # The device is reached by LAN IP, so default bridge networking is fine as
     # long as the Docker host can route to it.

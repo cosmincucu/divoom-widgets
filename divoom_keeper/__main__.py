@@ -53,7 +53,7 @@ def setup_logging() -> None:
 
 def default_config() -> dict:
     return {
-        "device_ip": "192.168.1.116",
+        "device_ip": "192.168.1.50",
         "interval_minutes": 60,
         "quality": DEFAULT_QUALITY,
         "speed": DEFAULT_SPEED,

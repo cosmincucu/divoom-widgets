@@ -1,109 +1,61 @@
-"""Run the usage widget: fetch usage, render a panel, push to the Times Gate.
+"""Deprecated entry point: delegates to the divoom_widgets framework.
 
-Usage:
-    python -m usage_widget                 # supervised loop forever
-    python -m usage_widget --once          # single update
-    python -m usage_widget --panel 3       # draw on panel 3 (overrides env)
-    python -m usage_widget --once --save out.png --no-push   # render only
-
-Loop mode runs each update as a short-lived **subprocess with a hard
-kill-timeout** instead of calling the work inline. A single update can hang
-indefinitely (e.g. DNS resolution after the machine wakes from sleep is not
-covered by requests' timeout); supervising it as a subprocess means a hung
-cycle is killed and the next one still runs. Progress is written to a logfile
-(DIVOOM_WIDGET_LOG) so it can be inspected even under pythonw.
+`python -m usage_widget` keeps working for one release (it runs only the
+claude_usage widget, like it always did). Switch to `python -m divoom_widgets`,
+which schedules every widget configured in the WIDGETS env var.
 """
 from __future__ import annotations
 
 import argparse
-import datetime as dt
 import os
-import socket
-import subprocess
 import sys
-import time
-
-from . import config
-from .claude import get_claude_usage
-from .device import TimesGate
-from .render import render
-
-LOG_FILE = os.environ.get(
-    "DIVOOM_WIDGET_LOG", os.path.join(os.path.expanduser("~"), ".divoom-usage-widget.log")
-)
-
-
-def _stamp() -> str:
-    return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _log(msg: str) -> None:
-    line = f"[{_stamp()}] {msg}"
-    print(line)
-    try:
-        with open(LOG_FILE, "a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
-    except OSError:
-        pass
-
-
-def _summ(claude: dict) -> str:
-    if claude.get("ok"):
-        return f"CLD session {claude['session_used']:.0f}% / weekly {claude['week_used']:.0f}%"
-    return f"CLD err:{claude.get('error')}"
-
-
-def update_once(device: TimesGate, panel: int, save: str | None, push: bool) -> bool:
-    claude = get_claude_usage()
-    image = render(claude)
-    if save:
-        image.save(save)
-    detail = "(not pushed)"
-    ok = True
-    if push:
-        ok, detail = device.push_image(image, panel)
-    print(f"[{_stamp()}] {_summ(claude)} -> panel {panel}: {'OK' if ok else 'FAIL'} {detail}")
-    return ok
-
-
-def _supervise(panel: int, host: str, interval: int) -> int:
-    """Loop: run `--once` as a subprocess each cycle, bounded by a kill-timeout."""
-    child_timeout = max(60, min(120, interval - 10))
-    cmd = [sys.executable, "-m", "usage_widget", "--once", "--panel", str(panel), "--host", host]
-    _log(f"supervisor start: panel {panel} on {host}, every {interval}s "
-         f"(child timeout {child_timeout}s); log {LOG_FILE}")
-    while True:
-        started = time.time()
-        try:
-            r = subprocess.run(cmd, timeout=child_timeout, capture_output=True, text=True)
-            out = (r.stdout or "").strip() or (r.stderr or "").strip() or f"exit {r.returncode}"
-            _log(f"cycle {time.time() - started:.0f}s: {out}")
-        except subprocess.TimeoutExpired:
-            _log(f"cycle TIMED OUT after {child_timeout}s — killed (likely a hung network call)")
-        except Exception as exc:  # supervisor must never die
-            _log(f"cycle error: {exc}")
-        time.sleep(interval)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="usage_widget")
-    parser.add_argument("--once", action="store_true", help="run a single update and exit")
-    parser.add_argument("--panel", type=int, default=config.WIDGET_PANEL, help="LCD panel 1-5")
-    parser.add_argument("--host", default=config.DIVOOM_HOST, help="Times Gate IP")
-    parser.add_argument("--interval", type=int, default=config.UPDATE_INTERVAL_SECONDS)
-    parser.add_argument("--save", default=None, help="also save the rendered PNG to this path")
-    parser.add_argument("--no-push", dest="push", action="store_false", help="render only; do not send")
+    parser.add_argument("--once", action="store_true")
+    parser.add_argument("--panel", type=int, default=None)
+    parser.add_argument("--host", default=None)
+    parser.add_argument("--interval", type=int, default=None)
+    parser.add_argument("--save", default=None)
+    parser.add_argument("--no-push", dest="push", action="store_false")
     args = parser.parse_args(argv)
 
-    panel = max(1, min(5, args.panel))
+    # Mutate env BEFORE importing divoom_widgets: its config freezes on import,
+    # and loop-mode children inherit these values through the environment.
+    # Load .env first so WIDGETS/WIDGET_PANEL set there are visible here.
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except Exception:
+        pass
+    if args.panel is not None:
+        os.environ["WIDGETS"] = f"claude_usage:{max(1, min(5, args.panel))}"
+    elif "claude_usage" not in os.environ.get("WIDGETS", ""):
+        # Legacy semantics: this entry point always runs the claude widget,
+        # on WIDGET_PANEL, regardless of what WIDGETS configures.
+        try:
+            panel = int(os.environ.get("WIDGET_PANEL", "1"))
+        except ValueError:
+            panel = 1
+        os.environ["WIDGETS"] = f"claude_usage:{max(1, min(5, panel))}"
+    if args.interval is not None:
+        os.environ["UPDATE_INTERVAL_SECONDS"] = str(args.interval)
 
+    from divoom_widgets.__main__ import main as run
+
+    print("usage_widget is deprecated; use `python -m divoom_widgets` instead",
+          file=sys.stderr)
+    new_argv = ["--widget", "claude_usage"]
     if args.once:
-        # Bound blocking socket ops so a single update can't hang forever.
-        socket.setdefaulttimeout(30)
-        device = TimesGate(args.host)
-        return 0 if update_once(device, panel, args.save, args.push) else 1
-
-    return _supervise(panel, args.host, args.interval)
+        new_argv.append("--once")
+    if args.host:
+        new_argv += ["--host", args.host]
+    if args.save:
+        new_argv += ["--save", args.save]
+    if not args.push:
+        new_argv.append("--no-push")
+    return run(new_argv)
 
 
 if __name__ == "__main__":

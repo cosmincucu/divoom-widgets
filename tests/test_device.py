@@ -2,7 +2,7 @@ import base64
 
 from PIL import Image
 
-from usage_widget.device import TimesGate
+from divoom_widgets.device import TimesGate
 
 
 def test_lcd_array_targets_and_clamps():

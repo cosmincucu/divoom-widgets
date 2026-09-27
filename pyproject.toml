@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "divoom-widgets"
-version = "0.2.0"
-description = "Show Claude usage (session + weekly limits) on a Divoom Times Gate pixel display"
+version = "0.3.0"
+description = "Widget framework for the Divoom Times Gate: Claude usage, home energy, and more"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { file = "LICENSE" }
-authors = [{ name = "Cosmin Cucu" }]
+authors = [{ name = "divoom-widgets contributors" }]
 keywords = ["divoom", "times-gate", "pixoo", "claude", "usage", "widget"]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -28,14 +28,12 @@ keeper = ["pystray>=0.19"]
 dev = ["pytest>=7.0"]
 
 [project.scripts]
+divoom-widgets = "divoom_widgets.__main__:main"
 divoom-usage-widget = "usage_widget.__main__:main"
 divoom-keeper = "divoom_keeper.__main__:main"
 
-[project.urls]
-Homepage = "https://github.com/cosmincucu/divoom-widgets"
-
 [tool.setuptools]
-packages = ["usage_widget", "divoom_keeper"]
+packages = ["divoom_widgets", "divoom_widgets.widgets", "usage_widget", "divoom_keeper"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
