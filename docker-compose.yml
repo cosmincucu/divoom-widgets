@@ -17,8 +17,11 @@ services:
       # inference-scoped and the usage endpoint needs user:profile (403).
       # Use the mounted credentials directory below instead.
       CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
-      # Codex widget: SigNoz query-service URL + API key (Settings → API Keys);
-      # the Codex transcripts must be shipped into that SigNoz as logs.
+      # Codex widget, live: the widget's OWN Codex login (CODEX_HOME=<dir> codex
+      # login), its directory mounted below. Empty = the SigNoz fallback.
+      CODEX_AUTH_PATH: ${CODEX_AUTH_PATH:-}
+      # Codex widget, fallback: SigNoz query-service URL + API key (Settings →
+      # API Keys); the Codex transcripts must be shipped into that SigNoz as logs.
       SIGNOZ_URL: ${SIGNOZ_URL:-}
       SIGNOZ_API_KEY: ${SIGNOZ_API_KEY:-}
       CODEX_SERVICE_NAME: ${CODEX_SERVICE_NAME:-codex-transcripts}
@@ -40,7 +43,9 @@ services:
     # side permanently breaks the other.
     # volumes:
     #   - ./claude:/app/.claude          # containing .credentials.json
-    # and set CLAUDE_CREDENTIALS_PATH: /app/.claude/.credentials.json
+    #   - ./codex:/app/.codex            # containing the widget's Codex auth.json
+    # and set CLAUDE_CREDENTIALS_PATH: /app/.claude/.credentials.json,
+    #         CODEX_AUTH_PATH: /app/.codex/auth.json
     # Unhealthy when the loop stops completing cycles OR the device itself
     # stops answering (see divoom_widgets/healthcheck.py).
     healthcheck:

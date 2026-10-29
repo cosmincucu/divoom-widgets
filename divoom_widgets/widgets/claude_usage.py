@@ -148,6 +148,37 @@ def _get_token() -> tuple[Optional[str], dict, bool]:
     return token, creds, False
 
 
+def _login_expires_at(creds: dict) -> Optional[dt.datetime]:
+    """When the login itself ends, refreshes or not.
+
+    Claude Code writes `refreshTokenExpiresAt` at login, about 30 days out, and
+    a token refresh does not move it: a login refreshes every 8 hours without
+    fault until that minute, and the first refresh after it gets
+    `invalid_grant: Refresh token expired`. So the credentials file has to be
+    replaced by a new login before that time, and the card says how long is
+    left rather than going dark on the day.
+    """
+    ms = (creds.get("claudeAiOauth") or {}).get("refreshTokenExpiresAt")
+    try:
+        ms = float(ms)
+    except (TypeError, ValueError):
+        return None
+    if ms <= 0:
+        return None
+    try:
+        return dt.datetime.fromtimestamp(ms / 1000, dt.timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def login_days_left(when: Optional[dt.datetime]) -> Optional[int]:
+    """Whole days until the login ends (0 on its last day), None if unknown."""
+    if not when:
+        return None
+    left = (when - dt.datetime.now(dt.timezone.utc)).total_seconds()
+    return max(0, int(left // 86400))
+
+
 def _api_get(path: str, token: str) -> requests.Response:
     return requests.get(f"{API_BASE}{path}", headers=_headers(token), timeout=15)
 
@@ -229,9 +260,14 @@ def get_claude_usage() -> dict:
         return {"ok": False, "error": f"creds: {exc}"}
     if not token:
         return {"ok": False, "error": "no access token"}
+    login_ends = _login_expires_at(creds)
     if dead:
         # Kept short so it fits the 128px card; summary() carries the remedy.
-        return {"ok": False, "error": "auth expired"}
+        # The date tells a login that reached its end of life apart from a
+        # copied file whose refresh token rotated away elsewhere.
+        ended = f" {login_ends:%-d %b}" if login_ends else ""
+        return {"ok": False, "error": f"auth expired{ended}",
+                "login_expires_at": login_ends}
 
     try:
         resp = _api_get("/api/oauth/usage", token)
@@ -260,6 +296,7 @@ def get_claude_usage() -> dict:
     return {
         "ok": True,
         "plan": _plan_label(token),
+        "login_expires_at": login_ends,
         "week_used": week.get("used", 0.0),
         "week_resets_at": week.get("resets_at"),
         "session_used": session.get("used", 0.0),
@@ -289,9 +326,13 @@ def summary(data: dict) -> str:
             text += f" / {s['label']} {s['used']:.0f}%"
         return text
     error = data.get("error")
-    if error == "auth expired":
-        return ("CLD err:auth expired — these credentials can no longer refresh; "
-                "supply a credentials file from its own Claude Code login")
+    if error and error.startswith("auth expired"):
+        ends = data.get("login_expires_at")
+        why = (f"this login's refresh token reached its end of life at {ends:%Y-%m-%d %H:%MZ}"
+               if ends else "these credentials can no longer refresh")
+        return (f"CLD err:{error} — {why}; log in again for the widget alone "
+                "(CLAUDE_CONFIG_DIR=<its own dir> claude auth login) and replace "
+                "the mounted credentials file")
     if error == "token scope":
         return ("CLD err:token scope — the usage endpoint needs user:profile, "
                 "which a `claude setup-token` token does not carry; use a "
@@ -310,7 +351,23 @@ def metrics(data: dict) -> list:
         out.append(("ai_plan_used_percent", w["used"], attrs))
         if w.get("resets_at"):
             out.append(("ai_plan_resets_at_seconds", w["resets_at"].timestamp(), attrs))
+    # When the login itself ends: the store can warn before the card goes dark.
+    if data.get("login_expires_at"):
+        out.append(("ai_plan_login_expires_seconds", data["login_expires_at"].timestamp(),
+                    {"vendor": "claude", "plan": data.get("plan", "")}))
     return out
+
+
+LOGIN_WARN_DAYS = 7
+
+
+def _header_tag(data: dict) -> str:
+    """The plan, or in the login's last week the number of days left: the one
+    place on the card with room, and the week is enough notice for a re-login."""
+    days = login_days_left(data.get("login_expires_at"))
+    if days is not None and days <= LOGIN_WARN_DAYS:
+        return f"RELOGIN {days}d"
+    return data.get("plan", "")
 
 
 def render(data: dict) -> Image.Image:
@@ -319,7 +376,7 @@ def render(data: dict) -> Image.Image:
     fonts = Fonts()
 
     header(draw, fonts, "CLAUDE", CLAUDE_BRAND,
-           data.get("plan", "") if data.get("ok") else "")
+           _header_tag(data) if data.get("ok") else "")
 
     if not data.get("ok"):
         draw.text((5, 52), "no data", font=fonts.title, fill=GRAY)

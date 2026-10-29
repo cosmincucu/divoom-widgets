@@ -77,14 +77,26 @@ CLAUDE_OAUTH_CLIENT_ID = _str(
 # for headless / Docker deploys where Claude Code is not installed.
 CLAUDE_OAUTH_TOKEN = _str("CLAUDE_CODE_OAUTH_TOKEN")
 
-# --- Codex (OpenAI ChatGPT plan) via a SigNoz store ------------------------
-# Codex has no usage endpoint a widget can call, but every turn it writes a
-# `token_count` event carrying the plan's rolling-window usage
-# (rate_limits.primary.used_percent / resets_at / window_minutes) into its
-# session transcript. If those transcripts are shipped into a SigNoz log
-# store, the widget reads the newest such event through SigNoz's query API.
-# It reads the codex.plan.* log attributes the shipping collector lifts out of
-# each token_count record, never the body (see widgets/codex_usage.py).
+# --- Codex (OpenAI ChatGPT plan), live --------------------------------------
+# The widget's OWN Codex login (`CODEX_HOME=<its own dir> codex login`, then
+# that dir's auth.json). With it set, the card reads the plan's standing live
+# from the endpoint the Codex CLI's status screen uses (widgets/codex_live.py)
+# and the SigNoz route below is not consulted. Never a copy of a login still in
+# use elsewhere: the two share one refresh token and the first rotation breaks
+# the other. Mount the directory, not the file — the refresh rewrites it.
+CODEX_AUTH_PATH = _str("CODEX_AUTH_PATH")
+# The Codex CLI's public OAuth client id (used for the token refresh).
+CODEX_OAUTH_CLIENT_ID = _str("CODEX_OAUTH_CLIENT_ID", "app_EMoamEEZ73f0CkXaXp7hrann")
+
+# --- Codex (OpenAI ChatGPT plan) via a SigNoz store, when there is no login --
+# Every Codex turn writes a `token_count` event carrying the plan's
+# rolling-window usage (rate_limits.primary.used_percent / resets_at /
+# window_minutes) into its session transcript. If those transcripts are shipped
+# into a SigNoz log store, the widget reads the newest such event through
+# SigNoz's query API — the figure as of the LAST TURN, so a window that
+# emptied since reads 0 and the card says how old the turn is. It reads the
+# codex.plan.* log attributes the shipping collector lifts out of each
+# token_count record, never the body (see widgets/codex_usage.py).
 # SIGNOZ_URL is the query-service, e.g. http://signoz.local:8081; the API key
 # comes from SigNoz → Settings → API Keys.
 SIGNOZ_URL = _str("SIGNOZ_URL").rstrip("/")
@@ -94,6 +106,11 @@ SIGNOZ_API_KEY_FILE = _str("SIGNOZ_API_KEY_FILE")
 CODEX_SERVICE_NAME = _str("CODEX_SERVICE_NAME", "codex-transcripts")
 # How far back to look for a token_count event (days). Older = "no data".
 CODEX_LOOKBACK_DAYS = max(1, _int("CODEX_LOOKBACK_DAYS", 15))
+# When the newest Codex buckets hold no plan record (Codex idle while open
+# sessions keep logging), the widget searches the whole lookback instead, at
+# most this often (seconds), and keeps the answer in CODEX_CACHE_FILE.
+CODEX_WIDE_REFRESH_SECONDS = max(60, _int("CODEX_WIDE_REFRESH_SECONDS", 6 * 3600))
+CODEX_CACHE_FILE = _str("CODEX_CACHE_FILE")
 
 # --- OTLP metrics (optional) ----------------------------------------------
 # When LO_ENDPOINT is set, every widget that exposes `metrics(data)` has its

@@ -106,3 +106,67 @@ def test_403_is_reported_as_a_scope_problem(monkeypatch):
     assert out["ok"] is False
     assert out["error"] == "token scope"
     assert "user:profile" in claude.summary(out)
+
+
+def _creds_with_login_end(expires_ms, login_ends_ms):
+    return {"claudeAiOauth": {"accessToken": "stale", "refreshToken": "old",
+                              "expiresAt": expires_ms,
+                              "refreshTokenExpiresAt": login_ends_ms}}
+
+
+def test_a_login_at_its_end_of_life_is_named_with_its_date(monkeypatch):
+    """A login that refreshed every 8 hours for 29 days, then got
+    `invalid_grant: Refresh token expired` at the minute Claude Code had
+    written in refreshTokenExpiresAt. Not a copied file, so the card and the
+    log must say which case it is."""
+    now = dt.datetime.now(dt.timezone.utc)
+    ended = now - dt.timedelta(hours=6)
+    monkeypatch.setattr(claude.config, "CLAUDE_OAUTH_TOKEN", "")
+    monkeypatch.setattr(claude, "_read_creds", lambda: _creds_with_login_end(
+        (now.timestamp() - 3600) * 1000, ended.timestamp() * 1000))
+    monkeypatch.setattr(claude, "_refresh_token", lambda creds: None)
+    monkeypatch.setattr(claude, "_api_get",
+                        lambda path, tok: (_ for _ in ()).throw(AssertionError("called")))
+    out = claude.get_claude_usage()
+    assert out["ok"] is False
+    assert out["error"] == f"auth expired {ended:%-d %b}"
+    text = claude.summary(out)
+    assert "end of life" in text and f"{ended:%Y-%m-%d}" in text
+    assert "claude auth login" in text
+    assert claude.render(out).size == (128, 128)
+
+
+def test_the_card_counts_down_the_login_in_its_last_week(monkeypatch):
+    claude._plan_cache = None
+    now = dt.datetime.now(dt.timezone.utc)
+    in_three_days = (now + dt.timedelta(days=3, hours=2)).replace(microsecond=0)
+    monkeypatch.setattr(claude.config, "CLAUDE_OAUTH_TOKEN", "")
+    monkeypatch.setattr(claude, "_read_creds", lambda: _creds_with_login_end(
+        (now.timestamp() + 7200) * 1000, int(in_three_days.timestamp() * 1000)))
+    monkeypatch.setattr(claude, "_api_get", _fake_api_get)
+    out = claude.get_claude_usage()
+    assert out["ok"] is True
+    assert out["login_expires_at"] == in_three_days
+    assert claude.login_days_left(out["login_expires_at"]) == 3
+    assert claude._header_tag(out) == "RELOGIN 3d"
+    gauges = {m[0]: m for m in claude.metrics(out)}
+    assert abs(gauges["ai_plan_login_expires_seconds"][1] - in_three_days.timestamp()) < 1
+    assert gauges["ai_plan_login_expires_seconds"][2]["vendor"] == "claude"
+    assert claude.render(out).size == (128, 128)
+    # With more than a week left the header shows the plan, as before.
+    far = dict(out, login_expires_at=now + dt.timedelta(days=20))
+    assert claude._header_tag(far) == "MAX 5x"
+    # A headless token or an old credentials file carries no end date.
+    assert claude._header_tag(dict(out, login_expires_at=None)) == "MAX 5x"
+    assert claude.login_days_left(None) is None
+    assert "ai_plan_login_expires_seconds" not in {
+        m[0] for m in claude.metrics(dict(out, login_expires_at=None))}
+
+
+def test_login_end_field_is_read_defensively():
+    assert claude._login_expires_at({}) is None
+    assert claude._login_expires_at({"claudeAiOauth": {"refreshTokenExpiresAt": "x"}}) is None
+    assert claude._login_expires_at({"claudeAiOauth": {"refreshTokenExpiresAt": 0}}) is None
+    assert claude._login_expires_at({"claudeAiOauth": {"refreshTokenExpiresAt": 1e300}}) is None
+    got = claude._login_expires_at({"claudeAiOauth": {"refreshTokenExpiresAt": 1792691792733}})
+    assert got == dt.datetime(2026, 10, 22, 17, 56, 32, 733000, tzinfo=dt.timezone.utc)

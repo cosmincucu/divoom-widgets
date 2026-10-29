@@ -2,12 +2,28 @@ import datetime as dt
 import math
 import re
 
+import pytest
+
 from divoom_widgets import emit
 from divoom_widgets.widgets import codex_usage as codex
 
+
+@pytest.fixture(autouse=True)
+def _own_cache_file(monkeypatch, tmp_path):
+    # Never read or write the real wide-search cache, and never read the live
+    # route: these tests are about the transcript store.
+    monkeypatch.setattr(codex.config, "CODEX_CACHE_FILE", str(tmp_path / "wide.json"))
+    monkeypatch.setattr(codex.config, "CODEX_AUTH_PATH", "")
+    # The fixtures' reset times are real stamps from 2026; the clock is pinned
+    # before all of them so the rows read as they did on the day.
+    monkeypatch.setattr(codex, "_now", lambda: NOW)
+
+
+NOW = dt.datetime(2026, 9, 23, 10, 0, tzinfo=dt.timezone.utc)
+
 # A row in the shape SigNoz's v5 raw query returns for the newest
 # token_count record (illustrative values: plan pro, 89% of a 10080-minute
-# window, 425 token_count records with plan fields in the newest buckets).
+# window, 425 token_count records with plan fields in the 8 newest buckets).
 ROW = {"n": 425, "used": 89, "resets_at": 1790417902, "window_minutes": 10080,
        "plan": "pro", "rec": "2026-09-23T09:12:12.299Z"}
 # What the aggregate returns for an empty window if the HAVING is ever lost:
@@ -17,6 +33,15 @@ EMPTY_AGGREGATE = {"n": 0, "used": 0, "resets_at": 0, "window_minutes": 0,
 # The row shape of the first version of the query (no `n`), still accepted.
 LEGACY_ROW = {"used": 63, "resets_at": 1789292517, "window_minutes": 10080,
               "plan": "prolite", "rec": "2026-09-07T08:29:48.567Z"}
+# A Plus account (illustrative values): the 5-hour window is `primary` and the
+# weekly one `secondary`; 315 records with plan fields in the newest buckets,
+# all of them carrying the second window.
+PLUS_ROW = {"n": 315, "used": 46, "resets_at": 1793163191, "window_minutes": 300,
+            "plan": "plus", "rec": "2026-10-28T00:04:12.225Z",
+            "n2": 315, "used2": 15, "resets_at2": 1793652828, "window_minutes2": 10080}
+# The same account read through a collector that lifts only the primary window:
+# the secondary columns come back as the map defaults (0), n2 = 0.
+PLUS_PRIMARY_ONLY = dict(PLUS_ROW, n2=0, used2=0, resets_at2=0, window_minutes2=0)
 
 
 class FakeResp:
@@ -57,8 +82,98 @@ def test_normalize_reads_the_plan_row():
                                               tzinfo=dt.timezone.utc)
 
 
+def test_normalize_reads_both_windows_of_a_plus_plan():
+    out = codex.normalize(PLUS_ROW)
+    assert out["ok"] is True and out["plan"] == "PLUS"
+    # Shortest window first, each labelled by its length, not its position.
+    assert [w["window_minutes"] for w in out["windows"]] == [300, 10080]
+    assert [w["used"] for w in out["windows"]] == [46.0, 15.0]
+    assert out["windows"][1]["resets_at"] == dt.datetime.fromtimestamp(1793652828, dt.timezone.utc)
+    # The weekly figure is the WEEKLY one, even though the payload put it second.
+    assert out["week_used"] == 15.0 and out["window_minutes"] == 10080
+    assert out["week_resets_at"] == dt.datetime.fromtimestamp(1793652828, dt.timezone.utc)
+    assert codex.summary(out).startswith("CDX session 46% / weekly 15% (PLUS")
+
+
+def test_a_primary_only_collector_shows_the_one_window_it_has():
+    # No record carried a second window: one row, named by its length — never
+    # "WEEKLY 5h", which is what a position-based label produces for a Plus plan.
+    out = codex.normalize(PLUS_PRIMARY_ONLY)
+    assert out["ok"] is True
+    assert [w["window_minutes"] for w in out["windows"]] == [300]
+    assert codex.summary(out).startswith("CDX session 46% (PLUS")
+    assert "weekly" not in codex.summary(out)
+    pct = [m for m in codex.metrics(out) if m[0] == "ai_plan_used_percent"]
+    assert [m[2]["window"] for m in pct] == ["5h"]
+    # A second window without a length is the map default, not a reading.
+    assert len(codex.normalize(dict(PLUS_ROW, window_minutes2=0))["windows"]) == 1
+    assert len(codex.normalize(dict(PLUS_ROW, n2=0))["windows"]) == 1
+
+
+def test_a_window_whose_reset_has_passed_reads_zero():
+    # The newest record said 46% of the 5-hour window with a reset time 30
+    # hours before `now`; a card that trusts the record still draws 46%. Now:
+    # 0%, no reset pending, and the weekly window, whose reset is still ahead,
+    # keeps its figure.
+    later = dt.datetime(2026, 10, 29, 11, 6, tzinfo=dt.timezone.utc)
+    out = codex.normalize(PLUS_ROW, now=later)
+    assert [w["used"] for w in out["windows"]] == [0.0, 15.0]
+    assert out["windows"][0]["resets_at"] is None and out["windows"][0]["expired"] is True
+    assert out["windows"][1]["resets_at"] == dt.datetime.fromtimestamp(1793652828, dt.timezone.utc)
+    assert codex.summary(out).startswith("CDX session 0% / weekly 15% (PLUS")
+    pct = {m[2]["window"]: m[1] for m in codex.metrics(out) if m[0] == "ai_plan_used_percent"}
+    assert pct == {"5h": 0.0, "7d": 15.0}
+    # Past the weekly reset too: both read 0, the weekly figure included.
+    out = codex.normalize(PLUS_ROW, now=dt.datetime(2026, 11, 3, tzinfo=dt.timezone.utc))
+    assert [w["used"] for w in out["windows"]] == [0.0, 0.0] and out["week_used"] == 0.0
+    # A record with no reset time cannot be expired: it keeps its figure.
+    out = codex.normalize(dict(ROW, resets_at=0), now=later)
+    assert out["week_used"] == 89.0 and "expired" not in out["windows"][0]
+    # The default clock is the module's, so the store route expires on its own.
+    assert codex.normalize(PLUS_ROW)["windows"][0]["used"] == 46.0   # NOW is pinned early
+    codex._now = lambda: later
+    assert codex.normalize(PLUS_ROW)["windows"][0]["used"] == 0.0
+
+
+def test_fetch_uses_the_live_route_when_a_login_is_configured(monkeypatch):
+    monkeypatch.setattr(codex.config, "CODEX_AUTH_PATH", "/nowhere/auth.json")
+    calls = []
+    monkeypatch.setattr(codex.codex_live, "get_usage", lambda: calls.append(1) or {"ok": True})
+    monkeypatch.setattr(codex, "get_codex_usage", lambda: pytest.fail("store route used"))
+    assert codex.fetch() == {"ok": True} and calls == [1]
+    # And never falls back to the store on a live failure.
+    monkeypatch.setattr(codex.codex_live, "get_usage", lambda: {"ok": False, "error": "x"})
+    assert codex.fetch()["ok"] is False
+
+
+def test_metrics_carry_one_gauge_per_window():
+    out = codex.metrics(codex.normalize(PLUS_ROW))
+    pct = {m[2]["window"]: m[1] for m in out if m[0] == "ai_plan_used_percent"}
+    assert pct == {"5h": 46.0, "7d": 15.0}
+    resets = {m[2]["window"]: m[1] for m in out if m[0] == "ai_plan_resets_at_seconds"}
+    assert resets == {"5h": 1793163191.0, "7d": 1793652828.0}
+    assert all(m[2]["plan"] == "plus" and m[2]["vendor"] == "codex" for m in out)
+
+
+def test_query_reads_the_second_window_from_the_newest_record_that_has_one():
+    sql = codex.query("codex-transcripts")
+    assert "mapContains(attributes_number, 'codex.plan.secondary.used_percent') AS cx_has2" in sql
+    for col, alias in (("cx_used2", "used2"), ("cx_resets_at2", "resets_at2"),
+                       ("cx_window_min2", "window_minutes2")):
+        assert re.search(rf"\bargMaxIf\({col}, cx_newest, cx_has2\)\s+AS {alias}\b", sql), alias
+    assert re.search(r"\bcountIf\(cx_has2\)\s+AS n2\b", sql)
+    # The newest record still decides the primary window and the plan: a host
+    # that lifts only the primary window must not hide a newer turn.
+    assert re.search(r"\bargMax\(cx_used, cx_newest\)\s+AS used\b", sql)
+
+
+def test_render_two_windows_is_128px():
+    assert codex.render(codex.normalize(PLUS_ROW)).size == (128, 128)
+    assert codex.render(codex.normalize(PLUS_PRIMARY_ONLY)).size == (128, 128)
+
+
 def test_normalize_accepts_the_first_query_row_shape():
-    out = codex.normalize(LEGACY_ROW)
+    out = codex.normalize(LEGACY_ROW, now=dt.datetime(2026, 9, 7, 9, 0, tzinfo=dt.timezone.utc))
     assert out["ok"] is True and out["plan"] == "PRO LITE"
     assert out["week_resets_at"] == dt.datetime(2026, 9, 13, 9, 41, 57, tzinfo=dt.timezone.utc)
 
@@ -201,7 +316,91 @@ def test_get_codex_usage_bad_service_name_sends_nothing(monkeypatch):
 def test_get_codex_usage_empty_aggregate_is_no_data(monkeypatch):
     _fake_signoz(monkeypatch, [EMPTY_AGGREGATE])
     out = codex.get_codex_usage()
-    assert out["ok"] is False and "no plan fields" in out["error"]
+    assert out["ok"] is False
+    assert out["error"] == f"no Codex plan record in {codex.config.CODEX_LOOKBACK_DAYS}d"
+
+
+def _fake_signoz_by_buckets(monkeypatch, recent_rows, wide_rows, calls):
+    """SigNoz answering the recent-bucket and the whole-lookback query apart."""
+    monkeypatch.setattr(codex.config, "SIGNOZ_URL", "http://signoz.test")
+    monkeypatch.setattr(codex, "_api_key", lambda: "k")
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        sql = json["compositeQuery"]["queries"][0]["spec"]["query"]
+        wide = f"LIMIT {codex.wide_buckets()})" in sql
+        calls.append("wide" if wide else "recent")
+        return FakeResp(200, _signoz_payload(wide_rows if wide else recent_rows))
+
+    monkeypatch.setattr(codex.requests, "post", fake_post)
+
+
+def test_idle_codex_falls_back_to_the_whole_lookback(monkeypatch):
+    # Codex idle for days while two open sessions kept logging
+    # thread_settings_applied, so the 8 newest Codex buckets held no plan
+    # record and the panel showed an error instead of the last figure.
+    calls = []
+    _fake_signoz_by_buckets(monkeypatch, [], [ROW], calls)
+    out = codex.get_codex_usage()
+    assert out["ok"] is True and out["week_used"] == 89.0
+    assert calls == ["recent", "wide"]
+
+
+def test_wide_search_is_cached_until_it_ages_out(monkeypatch):
+    calls = []
+    _fake_signoz_by_buckets(monkeypatch, [], [ROW], calls)
+    now = [1_790_000_000.0]
+    monkeypatch.setattr(codex.time, "time", lambda: now[0])
+    assert codex.get_codex_usage()["ok"] is True
+    now[0] += codex.config.CODEX_WIDE_REFRESH_SECONDS - 1
+    assert codex.get_codex_usage()["week_used"] == 89.0
+    assert calls == ["recent", "wide", "recent"]
+    now[0] += 1
+    assert codex.get_codex_usage()["ok"] is True
+    assert calls == ["recent", "wide", "recent", "recent", "wide"]
+
+
+def test_wide_miss_is_cached_too(monkeypatch):
+    calls = []
+    _fake_signoz_by_buckets(monkeypatch, [], [EMPTY_AGGREGATE], calls)
+    for _ in range(3):
+        assert codex.get_codex_usage()["ok"] is False
+    assert calls == ["recent", "wide", "recent", "recent"]
+
+
+def test_a_recent_turn_beats_the_cache(monkeypatch):
+    calls = []
+    _fake_signoz_by_buckets(monkeypatch, [], [ROW], calls)
+    codex.get_codex_usage()
+    newer = dict(ROW, used=12, rec="2026-10-02T09:00:00Z")
+    _fake_signoz_by_buckets(monkeypatch, [newer], [ROW], calls)
+    assert codex.get_codex_usage()["week_used"] == 12.0
+
+
+def test_failed_wide_search_is_not_cached(monkeypatch):
+    monkeypatch.setattr(codex.config, "SIGNOZ_URL", "http://signoz.test")
+    monkeypatch.setattr(codex, "_api_key", lambda: "k")
+    answers = [FakeResp(200, _signoz_payload([])), FakeResp(502, {})]
+    monkeypatch.setattr(codex.requests, "post", lambda *a, **k: answers.pop(0))
+    out = codex.get_codex_usage()
+    assert out["ok"] is False and "502" in out["error"]
+    calls = []
+    _fake_signoz_by_buckets(monkeypatch, [], [ROW], calls)
+    assert codex.get_codex_usage()["ok"] is True and calls == ["recent", "wide"]
+
+
+def test_unreadable_cache_means_a_new_wide_search(monkeypatch):
+    with open(codex.config.CODEX_CACHE_FILE, "w", encoding="utf-8") as fh:
+        fh.write("{not json")
+    calls = []
+    _fake_signoz_by_buckets(monkeypatch, [], [ROW], calls)
+    assert codex.get_codex_usage()["ok"] is True and calls == ["recent", "wide"]
+
+
+def test_wide_query_covers_every_bucket_in_the_lookback():
+    sql = codex.query("codex-transcripts", codex.wide_buckets())
+    assert f"LIMIT {codex.config.CODEX_LOOKBACK_DAYS * 48 + 1})" in sql
+    assert sql.replace(f"LIMIT {codex.wide_buckets()})", "") == \
+        codex.query("codex-transcripts").replace(f"LIMIT {codex.RECENT_BUCKETS})", "")
 
 
 def test_fetch_to_gauges_keeps_source_time_apart_from_emission_time(monkeypatch):
@@ -229,7 +428,7 @@ def test_get_codex_usage_no_rows(monkeypatch):
     monkeypatch.setattr(codex.requests, "post",
                         lambda *a, **k: FakeResp(200, _signoz_payload([])))
     out = codex.get_codex_usage()
-    assert out["ok"] is False and "no plan fields" in out["error"]
+    assert out["ok"] is False and "no Codex plan record" in out["error"]
 
 
 def test_get_codex_usage_http_error(monkeypatch):

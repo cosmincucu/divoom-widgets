@@ -33,8 +33,13 @@ def main() -> None:
     _save(claude_usage.render(claude), "preview-claude.png")
 
     codex = {
-        "ok": True, "plan": "PRO", "plan_raw": "pro",
-        "week_used": 42.0, "week_resets_at": NOW + dt.timedelta(days=4, hours=7),
+        "ok": True, "source": "live", "plan": "PLUS", "plan_raw": "plus",
+        "windows": [
+            {"used": 46.0, "window_minutes": 300,
+             "resets_at": NOW + dt.timedelta(hours=2, minutes=11)},
+            {"used": 15.0, "window_minutes": 10080,
+             "resets_at": NOW + dt.timedelta(days=4, hours=7)},
+        ],
         "window_minutes": 10080, "last_turn_at": NOW - dt.timedelta(minutes=12),
     }
     _save(codex_usage.render(codex), "preview-codex.png")
