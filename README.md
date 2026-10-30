@@ -11,10 +11,14 @@ Widgets included:
   the plan reports one, the **per-model weekly** limit utilization for a Claude
   **Pro/Max** plan, straight from the OAuth endpoint Claude Code's `/usage`
   command uses.
-- **Codex usage** — the **weekly plan limit** of an OpenAI **ChatGPT/Codex**
-  subscription, read from the `token_count` events Codex writes into its own
-  session transcripts — via a **SigNoz** log store those transcripts are shipped
-  to (Codex has no usage endpoint a widget can call).
+- **Codex usage** — the rolling limits of an OpenAI **ChatGPT/Codex**
+  subscription, live from the endpoint the Codex CLI's own status screen
+  reads, with a Codex login that belongs to the widget. A **Plus** plan draws
+  its **5-hour session** and **weekly** windows; a **Pro** plan, which has no
+  5-hour limit, draws the weekly cap alone and says so. Without a login the
+  widget falls back to the `token_count` events Codex writes into its session
+  transcripts, via a **SigNoz** log store they are shipped to — the figure as of
+  the last turn, with windows that have since reset read as 0%.
 - **Home energy** — current **house load**, **solar generation**, and **battery
   state of charge** from **Home Assistant** (e.g. a Tesla Powerwall).
 
@@ -118,7 +122,9 @@ All via `.env` (see [.env.example](.env.example)):
 | `CLAUDE_CREDENTIALS_PATH` | `~/.claude/.credentials.json` | Override only if non-standard |
 | `CLAUDE_CODE_OAUTH_TOKEN` | — | Headless alternative (`claude setup-token`) — see the 403 note below |
 | `CODEX_INTERVAL_SECONDS` | `UPDATE_INTERVAL_SECONDS` | Codex widget refresh (min 15) |
-| `SIGNOZ_URL` | — | SigNoz query-service the Codex transcripts are shipped to, e.g. `http://10.0.0.5:8081` |
+| `CODEX_AUTH_PATH` | — | The widget's **own** Codex login (`CODEX_HOME=~/divoom-codex codex login`, then that dir's `auth.json`). Set = live route; the SigNoz settings below are then unused |
+| `CODEX_OAUTH_CLIENT_ID` | the Codex CLI's | OAuth client id used to refresh that login's access token |
+| `SIGNOZ_URL` | — | Fallback without a login: SigNoz query-service the Codex transcripts are shipped to, e.g. `http://10.0.0.5:8081` |
 | `SIGNOZ_API_KEY` / `SIGNOZ_API_KEY_FILE` | — | SigNoz → Settings → API Keys (viewer role is enough) |
 | `CODEX_SERVICE_NAME` | `codex-transcripts` | `service.name` the transcripts carry in the store |
 | `CODEX_LOOKBACK_DAYS` | `15` | Oldest `token_count` event still shown |
@@ -179,7 +185,7 @@ Mint an independent one with a separate config directory, then mount it:
 
 ```bash
 # 1. A login that belongs to the widget alone
-CLAUDE_CONFIG_DIR=~/divoom-claude claude      # complete the browser login, then quit
+CLAUDE_CONFIG_DIR=~/divoom-claude claude auth login   # complete the browser login
 
 # 2. Hand its credentials to the container (mount the DIRECTORY, not the file:
 #    refreshing writes a tempfile and renames it over the old one)
@@ -193,6 +199,33 @@ docker compose up -d --build
 > `claude setup-token` looks like the headless answer but is **not** usable
 > here: those tokens are inference-scoped, while the usage endpoint requires
 > `user:profile` and returns 403. The widget reports this as `token scope`.
+
+> **A login lasts about 30 days, refreshes or not.** Claude Code writes
+> `refreshTokenExpiresAt` into the credentials file at login and refreshing the
+> access token does not move it: a login refreshes every 8 hours without fault
+> and then gets `invalid_grant: Refresh token expired` at the minute that field
+> names, about 30 days in. So repeat step 1 and 2 before that date. The card's
+> header switches from the plan name to `RELOGIN <n>d` in the last week, the
+> log line names the date once it has passed (`auth expired 22 Oct`), and the
+> metrics store gets `ai_plan_login_expires_seconds` so a dashboard can warn
+> ahead.
+
+The Codex widget works the same way, with a Codex login of its own:
+
+```bash
+# 1. A Codex login that belongs to the widget alone
+CODEX_HOME=~/divoom-codex codex login                 # complete the browser login
+
+# 2. Mount its directory (the widget rewrites auth.json when it refreshes the token)
+mkdir -p ./codex && cp ~/divoom-codex/auth.json ./codex/
+# docker-compose.yml: CODEX_AUTH_PATH=/app/.codex/auth.json and the ./codex:/app/.codex volume
+```
+
+> The access token lives ten days and the widget refreshes it itself with the
+> refresh token, writing the rotation back — which is why the login must not be
+> shared with a Codex you still use. When the server refuses a refresh (a revoked
+> login, a password change) the card reads `auth expired`, names the fix, and
+> the log line spells it out; repeat steps 1 and 2.
 
 The container reaches the device by LAN IP, so default bridge networking is
 fine as long as the Docker host can route to it. The healthcheck
@@ -218,15 +251,25 @@ provider fetch() ─► render 128×128 card ─► Draw/SendHttpGif ─► one 
   It returns 5-hour and 7-day *utilization* percentages — as a `limits` list
   (`session`, `weekly_all`, `weekly_scoped` per model) on current accounts,
   with the older `five_hour`/`seven_day` buckets as the fallback.
-- **Codex data** is the newest `token_count` event of Codex's session
-  transcripts (`payload.rate_limits.primary.{used_percent, resets_at,
-  window_minutes}`, `plan_type`), fetched with one ClickHouse SQL query through
-  SigNoz's `POST /api/v5/query_range`. The query reads log attributes, not
+- **Codex data** comes from `GET https://chatgpt.com/backend-api/wham/usage`
+  (`Authorization: Bearer <tokens.access_token>`, `ChatGPT-Account-Id`), the
+  call behind the Codex CLI's status screen: `plan_type` and a `rate_limit`
+  with a `primary_window` and, on plans that have two limits, a
+  `secondary_window`, each `{used_percent, limit_window_seconds,
+  reset_after_seconds, reset_at}`. Windows are labelled by their length, never
+  their position (Plus puts the 5-hour window first; Pro has only the weekly
+  one). The ten-day access token is refreshed through
+  `POST https://auth.openai.com/oauth/token` with the CLI's client id.
+  Without `CODEX_AUTH_PATH` the widget instead reads the newest `token_count`
+  event of Codex's session transcripts (`payload.rate_limits.primary.{used_percent,
+  resets_at, window_minutes}`, `plan_type`) with one ClickHouse SQL query through
+  SigNoz's `POST /api/v5/query_range`; "current" then means "as of the last
+  Codex turn", the card says how long ago that was, and a window whose reset
+  time has passed since is drawn as 0%. The query reads log attributes, not
   the transcript body, so the collector shipping the transcripts must lift
   those fields into `codex.plan.{used_percent, resets_at, window_minutes,
   plan_type}` and `codex.timestamp` attributes; records without them are
-  invisible to the widget. "Current" means "as of the last Codex turn"; the
-  card says how long ago that was.
+  invisible to the widget.
 - **Energy data** comes from Home Assistant's REST API: three
   `GET /api/states/<entity_id>` calls; power honors each sensor's
   `unit_of_measurement` (kW/W), battery charge is 0–100%.
